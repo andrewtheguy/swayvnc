@@ -1,0 +1,389 @@
+From b4d8574d03769504049a444864c1c74619b64743 Mon Sep 17 00:00:00 2001
+From: Andrew Chen <andrew@jaanuu.com>
+Date: Mon, 7 Sep 2026 12:15:08 -0700
+Subject: [PATCH] Report the captured output's scale to clients that ask, and
+ take a client density
+
+A private RFB extension: the pseudo-encoding 'SVNC' in SetEncodings asks for
+OutputScale messages (type 0xE0, size in pixels plus a 16.16 scale), sent as
+the ack and whenever the captured output's scale or size changes. A client may
+declare its own density with the same message type; this version records it.
+---
+ include/output-management.h |  10 +++
+ include/output.h            |   7 ++
+ src/main.c                  | 137 ++++++++++++++++++++++++++++++++++++
+ src/output-management.c     |  47 ++++++++++++-
+ src/output.c                |  11 +++
+ 5 files changed, 210 insertions(+), 2 deletions(-)
+
+diff --git a/include/output-management.h b/include/output-management.h
+index aae69ea..babdc58 100644
+--- a/include/output-management.h
++++ b/include/output-management.h
+@@ -22,7 +22,17 @@
+ struct output;
+ struct zwlr_output_manager_v1;
+ 
++typedef void (*wlr_output_manager_head_scale_fn)(const char* name,
++		double scale, void* userdata);
++
+ void wlr_output_manager_setup(struct zwlr_output_manager_v1* output_manager);
++/* The exact scale the compositor reports for the head named name, fractional
++ * included. False when no head of that name has reported one.
++ */
++bool wlr_output_manager_get_head_scale(const char* name, double* scale);
++/* Called once per done event for every head whose scale changed. */
++void wlr_output_manager_set_head_scale_fn(wlr_output_manager_head_scale_fn fn,
++		void* userdata);
+ bool wlr_output_manager_resize_output(struct output* output,
+ 	uint16_t width, uint16_t height);
+ void wlr_output_manager_destroy(void);
+diff --git a/include/output.h b/include/output.h
+index 8706d9b..d5c9ab3 100644
+--- a/include/output.h
++++ b/include/output.h
+@@ -55,12 +55,19 @@ struct output {
+ 	char description[256];
+ 	enum output_power_state power;
+ 
++	/* wl_output's integer scale: the fallback when output-management has
++	 * no head of this name. wlroots reports ceil(scale) here.
++	 */
++	int32_t wl_scale;
++
+ 	bool is_dimension_changed;
+ 	bool is_transform_changed;
++	bool is_scale_changed;
+ 	bool is_headless;
+ 
+ 	void (*on_dimension_change)(struct output*);
+ 	void (*on_transform_change)(struct output*);
++	void (*on_scale_change)(struct output*);
+ 	void (*on_power_change)(struct output*);
+ 
+ 	void* userdata;
+diff --git a/src/main.c b/src/main.c
+index f7cfc9a..62c0d53 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -149,14 +149,34 @@ struct wayvnc_client {
+ 	struct pointer pointer;
+ 	struct keyboard keyboard;
+ 	struct data_control data_control;
++
++	/* The swayvnc density extension: whether this client asked for the
++	 * captured output's scale, and the display density it declared.
++	 */
++	bool wants_output_scale;
++	double declared_density;
+ };
+ 
++/* A private RFB extension carrying pixel density, which standard RFB has no
++ * word for. The client lists the pseudo-encoding in SetEncodings; the server
++ * answers with an OutputScale message and repeats it whenever the captured
++ * output's scale or size changes. The client may declare its own density with
++ * a ClientDensity message. Scales are 16.16 unsigned fixed point.
++ */
++#define SWAYVNC_ENCODING_DENSITY 0x53564e43 /* 'SVNC' */
++#define SWAYVNC_MSG_DENSITY 0xe0
++#define SWAYVNC_OUTPUT_SCALE_LEN 10
++#define SWAYVNC_CLIENT_DENSITY_LEN 8
++
+ void wayvnc_exit(struct wayvnc* self);
+ void on_capture_done(enum screencopy_result result, struct wv_buffer* buffer,
+ 		void* userdata);
+ static void on_cursor_capture_done(enum screencopy_result result,
+ 		struct wv_buffer* buffer, void* userdata);
+ static void on_nvnc_client_new(struct nvnc_client* client);
++static void broadcast_output_scale(struct wayvnc* self);
++static void on_head_scale_change(const char* name, double scale,
++		void* userdata);
+ void switch_to_output(struct wayvnc*, struct output*);
+ void switch_to_next_output(struct wayvnc*);
+ void switch_to_prev_output(struct wayvnc*);
+@@ -288,6 +308,8 @@ static void registry_add(void* data, struct wl_registry* registry,
+ 			wl_registry_bind(registry, id,
+ 				&zwlr_output_manager_v1_interface, 1);
+ 		wlr_output_manager_setup(wlr_output_manager);
++		wlr_output_manager_set_head_scale_fn(on_head_scale_change,
++				self);
+ 		return;
+ 	}
+ 
+@@ -988,6 +1010,8 @@ static int init_nvnc(struct wayvnc* self, const char* addr, uint16_t port,
+ 
+ 	nvnc_set_new_client_fn(self->nvnc, on_nvnc_client_new);
+ 	nvnc_set_cut_text_fn(self->nvnc, on_client_cut_text);
++	nvnc_set_client_encodings_fn(self->nvnc, on_client_encodings);
++	nvnc_set_client_message_fn(self->nvnc, on_client_extension_message);
+ 
+ 	if (blank_screen(self) != 0)
+ 		goto blank_screen_failure;
+@@ -1063,6 +1087,110 @@ static void wayvnc_restart_capture(struct wayvnc* self)
+ 	aml_start(aml_get_default(), self->capture_retry_timer);
+ }
+ 
++static double output_scale(const struct output* output)
++{
++	double scale;
++	if (wlr_output_manager_get_head_scale(output->name, &scale))
++		return scale;
++	return output->wl_scale > 0 ? output->wl_scale : 1.0;
++}
++
++static void send_output_scale(struct wayvnc_client* client)
++{
++	struct output* output = client->server->selected_output;
++	if (!client->wants_output_scale || !output)
++		return;
++
++	double scale = output_scale(output);
++	uint32_t fixed = (uint32_t)(scale * 65536.0 + 0.5);
++	uint16_t width = output_get_transformed_width(output);
++	uint16_t height = output_get_transformed_height(output);
++
++	uint8_t msg[SWAYVNC_OUTPUT_SCALE_LEN] = {
++		SWAYVNC_MSG_DENSITY, 0,
++		width >> 8, width & 0xff,
++		height >> 8, height & 0xff,
++		fixed >> 24, (fixed >> 16) & 0xff, (fixed >> 8) & 0xff,
++		fixed & 0xff,
++	};
++
++	nvnc_log(NVNC_LOG_DEBUG,
++		"Reporting output %s to client %u: %ux%u at scale %.2f",
++		output->name, client->id, width, height, scale);
++	nvnc_client_send_message(client->nvnc_client, msg, sizeof(msg));
++}
++
++static void broadcast_output_scale(struct wayvnc* self)
++{
++	struct nvnc_client* nvnc_client;
++	for (nvnc_client = nvnc_client_first(self->nvnc); nvnc_client;
++			nvnc_client = nvnc_client_next(nvnc_client)) {
++		struct wayvnc_client* client = nvnc_get_userdata(nvnc_client);
++		if (client)
++			send_output_scale(client);
++	}
++}
++
++static void on_client_encodings(struct nvnc_client* nvnc_client,
++		const int32_t* encodings, size_t n_encodings)
++{
++	struct wayvnc_client* client = nvnc_get_userdata(nvnc_client);
++	if (!client)
++		return;
++
++	bool wanted = false;
++	for (size_t i = 0; i < n_encodings; ++i)
++		if (encodings[i] == SWAYVNC_ENCODING_DENSITY)
++			wanted = true;
++
++	if (wanted && !client->wants_output_scale)
++		nvnc_log(NVNC_LOG_INFO, "Client %u asked for output scale reports",
++				client->id);
++
++	client->wants_output_scale = wanted;
++	send_output_scale(client);
++}
++
++static int on_client_extension_message(struct nvnc_client* nvnc_client,
++		const uint8_t* msg, size_t len)
++{
++	if (msg[0] != SWAYVNC_MSG_DENSITY)
++		return -1;
++	if (len < SWAYVNC_CLIENT_DENSITY_LEN)
++		return 0;
++
++	struct wayvnc_client* client = nvnc_get_userdata(nvnc_client);
++	uint32_t fixed = (uint32_t)msg[4] << 24 | (uint32_t)msg[5] << 16 |
++		(uint32_t)msg[6] << 8 | msg[7];
++	double density = fixed / 65536.0;
++
++	if (client) {
++		client->declared_density = density;
++		nvnc_log(NVNC_LOG_INFO, "Client %u declares a display density of %.2f",
++				client->id, density);
++	}
++	return SWAYVNC_CLIENT_DENSITY_LEN;
++}
++
++static void on_output_scale_change(struct output* output)
++{
++	struct wayvnc* self = output->userdata;
++	if (self->selected_output != output)
++		return;
++
++	nvnc_log(NVNC_LOG_DEBUG, "Output %s scale is now %.2f", output->name,
++			output_scale(output));
++	broadcast_output_scale(self);
++}
++
++static void on_head_scale_change(const char* name, double scale, void* userdata)
++{
++	struct wayvnc* self = userdata;
++	struct output* output = output_find_by_name(&self->outputs, name);
++	if (output && output->userdata == self)
++		on_output_scale_change(output);
++}
++
+ // TODO: Handle transform change too
+ void on_output_dimension_change(struct output* output)
+ {
+@@ -1072,6 +1200,11 @@ void on_output_dimension_change(struct output* output)
+ 	if (self->nr_clients == 0)
+ 		return;
+ 
++	/* Before the capture restarts, so the report reaches the client ahead
++	 * of the resize rectangle that carries the new framebuffer.
++	 */
++	broadcast_output_scale(self);
++
+ 	nvnc_log(NVNC_LOG_DEBUG, "Output dimensions changed. Restarting frame capturer...");
+ 
+ 	screencopy_stop(self->screencopy);
+@@ -1694,15 +1827,19 @@ void set_selected_output(struct wayvnc* self, struct output* output)
+ {
+ 	if (self->selected_output) {
+ 		self->selected_output->on_dimension_change = NULL;
++		self->selected_output->on_scale_change = NULL;
+ 	}
+ 	self->selected_output = output;
+ 	output->on_dimension_change = on_output_dimension_change;
++	output->on_scale_change = on_output_scale_change;
+ 	output->on_power_change = on_output_power_change;
+ 	output->userdata = self;
+ 
+ 	if (self->ctl)
+ 		ctl_server_event_capture_changed(self->ctl, output->name);
+ 	log_selected_output(self);
++	if (self->nvnc)
++		broadcast_output_scale(self);
+ }
+ 
+ void switch_to_output(struct wayvnc* self, struct output* output)
+diff --git a/src/output-management.c b/src/output-management.c
+index 79cb705..0bdfb73 100644
+--- a/src/output-management.c
++++ b/src/output-management.c
+@@ -28,11 +28,16 @@ struct output_manager_head {
+ 	struct wl_list link;
+ 	char* name;
+ 	bool enabled;
++	double scale;
++	bool has_scale;
++	bool is_scale_changed;
+ };
+ 
+ static struct wl_list heads;
+ static uint32_t last_config_serial;
+ static struct zwlr_output_manager_v1* wlr_output_manager;
++static wlr_output_manager_head_scale_fn head_scale_fn;
++static void* head_scale_userdata;
+ 
+ /* single head properties */
+ static void output_head_name(void* data,
+@@ -95,10 +100,15 @@ static void output_head_transform(void* data,
+ static void output_head_scale(void* data,
+ 		struct zwlr_output_head_v1* output_head, wl_fixed_t scale_f)
+ {
+-#ifndef NDEBUG
++	struct output_manager_head* head = data;
+ 	double scale = wl_fixed_to_double(scale_f);
+ 	nvnc_trace("Got head scale: %.2f", scale);
+-#endif
++
++	if (!head->has_scale || scale != head->scale)
++		head->is_scale_changed = true;
++
++	head->scale = scale;
++	head->has_scale = true;
+ }
+ 
+ static void output_head_finished(void* data,
+@@ -162,6 +172,16 @@ static void output_manager_done(void* data,
+ {
+ 	last_config_serial = serial;
+ 	nvnc_trace("Got new serial: %u", serial);
++
++	struct output_manager_head* head;
++	wl_list_for_each(head, &heads, link) {
++		if (!head->is_scale_changed)
++			continue;
++		head->is_scale_changed = false;
++		if (head_scale_fn && head->name)
++			head_scale_fn(head->name, head->scale,
++					head_scale_userdata);
++	}
+ }
+ 
+ static void output_manager_finished(void* data,
+@@ -197,6 +217,29 @@ static const struct zwlr_output_manager_v1_listener
+ };
+ 
+ /* Public API */
++bool wlr_output_manager_get_head_scale(const char* name, double* scale)
++{
++	if (!wlr_output_manager || !name)
++		return false;
++
++	struct output_manager_head* head;
++	wl_list_for_each(head, &heads, link) {
++		if (head->has_scale && head->name &&
++				strcmp(head->name, name) == 0) {
++			*scale = head->scale;
++			return true;
++		}
++	}
++	return false;
++}
++
++void wlr_output_manager_set_head_scale_fn(wlr_output_manager_head_scale_fn fn,
++		void* userdata)
++{
++	head_scale_fn = fn;
++	head_scale_userdata = userdata;
++}
++
+ void wlr_output_manager_setup(struct zwlr_output_manager_v1* output_manager)
+ {
+ 	if (wlr_output_manager)
+diff --git a/src/output.c b/src/output.c
+index 88420f9..38952b2 100644
+--- a/src/output.c
++++ b/src/output.c
+@@ -166,13 +166,23 @@ static void output_handle_done(void* data, struct wl_output* wl_output)
+ 	if (output->is_transform_changed && output->on_transform_change)
+ 		output->on_transform_change(output);
+ 
++	if (output->is_scale_changed && output->on_scale_change)
++		output->on_scale_change(output);
++
+ 	output->is_dimension_changed = false;
+ 	output->is_transform_changed = false;
++	output->is_scale_changed = false;
+ }
+ 
+ static void output_handle_scale(void* data, struct wl_output* wl_output,
+ 				int32_t factor)
+ {
++	struct output* output = data;
++
++	if (factor != output->wl_scale)
++		output->is_scale_changed = true;
++
++	output->wl_scale = factor;
+ }
+ 
+ static const struct wl_output_listener output_listener = {
+@@ -407,6 +417,7 @@ struct output* output_new(struct wl_output* wl_output, uint32_t id)
+ 	output->wl_output = wl_output;
+ 	output->id = id;
+ 	output->power = OUTPUT_POWER_UNKNOWN;
++	output->wl_scale = 1;
+ 
+ 	wl_output_add_listener(output->wl_output, &output_listener,
+ 			output);
+-- 
+2.51.1
+

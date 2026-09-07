@@ -1,0 +1,139 @@
+From f1eff5fece95f66596acb32666b4e4ef9483e469 Mon Sep 17 00:00:00 2001
+From: Andrew Chen <andrew@jaanuu.com>
+Date: Mon, 7 Sep 2026 12:15:08 -0700
+Subject: [PATCH] Let the application see raw client encodings, handle unknown
+ message types and send its own messages
+
+Three small hooks so an application can carry a private RFB extension without
+the library knowing its shape: the client's SetEncodings list as sent, a
+handler for client message types the library does not dispatch, and a way to
+write one server message to one client.
+---
+ include/common.h  |  2 ++
+ include/neatvnc.h | 21 +++++++++++++++++++++
+ src/server.c      | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/include/common.h b/include/common.h
+index e0b87c2..9500f7f 100644
+--- a/include/common.h
++++ b/include/common.h
+@@ -174,6 +174,8 @@ struct nvnc {
+ 	nvnc_cut_text_fn cut_text_fn;
+ 	struct cut_text ext_clipboard_provide_msg;
+ 	nvnc_desktop_layout_fn desktop_layout_fn;
++	nvnc_client_encodings_fn client_encodings_fn;
++	nvnc_client_message_fn client_message_fn;
+ 	struct nvnc_display* display;
+ 	struct {
+ 		struct nvnc_fb* buffer;
+diff --git a/include/neatvnc.h b/include/neatvnc.h
+index 78d9f97..8ae5a84 100644
+--- a/include/neatvnc.h
++++ b/include/neatvnc.h
+@@ -132,6 +132,20 @@ typedef void (*nvnc_cleanup_fn)(void* userdata);
+ typedef void (*nvnc_log_fn)(const struct nvnc_log_data*, const char* message);
+ typedef bool (*nvnc_desktop_layout_fn)(
+ 		struct nvnc_client*, const struct nvnc_desktop_layout*);
++/* Called after every SetEncodings with the list exactly as the client sent it,
++ * unknown and pseudo-encodings included, so an application can negotiate its
++ * own extensions. The library has already kept the encodings it understands.
++ */
++typedef void (*nvnc_client_encodings_fn)(struct nvnc_client*,
++		const int32_t* encodings, size_t n_encodings);
++/* Called for a client message whose type the library does not handle. msg
++ * points at the type byte and len is what has been received so far. Return
++ * the message's total length once it has been consumed, 0 when more bytes are
++ * needed, or a negative value for a type the application does not know
++ * either, after which the client is closed as before.
++ */
++typedef int (*nvnc_client_message_fn)(struct nvnc_client*,
++		const uint8_t* msg, size_t len);
+ 
+ extern const char nvnc_version[];
+ 
+@@ -170,6 +184,13 @@ void nvnc_set_new_client_fn(struct nvnc* self, nvnc_client_fn);
+ void nvnc_set_client_cleanup_fn(struct nvnc_client* self, nvnc_client_fn fn);
+ void nvnc_set_cut_text_fn(struct nvnc*, nvnc_cut_text_fn fn);
+ void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn);
++void nvnc_set_client_encodings_fn(struct nvnc* self, nvnc_client_encodings_fn);
++void nvnc_set_client_message_fn(struct nvnc* self, nvnc_client_message_fn);
++/* Write one complete server-to-client message, type byte included, to a
++ * client. The buffer is copied. Returns what the stream write returns.
++ */
++int nvnc_client_send_message(struct nvnc_client* client, const void* msg,
++		size_t len);
+ 
+ bool nvnc_has_auth(void);
+ int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
+diff --git a/src/server.c b/src/server.c
+index b94ed0d..3c8e1d2 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -688,6 +688,18 @@ static int on_client_set_encodings(struct nvnc_client* client)
+ 	if (client_has_encoding(client, RFB_ENCODING_FENCE))
+ 		send_ping(client, 0);
+ 
++	nvnc_client_encodings_fn encodings_fn =
++		client->server->client_encodings_fn;
++	if (encodings_fn && n_encodings > 0) {
++		int32_t* list = malloc(n_encodings * sizeof(*list));
++		if (list) {
++			for (size_t i = 0; i < n_encodings; ++i)
++				list[i] = ntohl(msg->encodings[i]);
++			encodings_fn(client, list, n_encodings);
++			free(list);
++		}
++	}
++
+ 	return sizeof(*msg) + 4 * n_encodings;
+ }
+ 
+@@ -1881,6 +1893,15 @@ static int on_client_message(struct nvnc_client* client)
+ 		return on_client_fence(client);
+ 	}
+ 
++	nvnc_client_message_fn message_fn = client->server->client_message_fn;
++	if (message_fn) {
++		int rc = message_fn(client,
++				client->msg_buffer + client->buffer_index,
++				client->buffer_len - client->buffer_index);
++		if (rc >= 0)
++			return rc;
++	}
++
+ 	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable message from client: %p",
+ 			client);
+ 	nvnc_client_close(client);
+@@ -2600,6 +2621,28 @@ void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn fn)
+ 	self->desktop_layout_fn = fn;
+ }
+ 
++EXPORT
++void nvnc_set_client_encodings_fn(struct nvnc* self,
++		nvnc_client_encodings_fn fn)
++{
++	self->client_encodings_fn = fn;
++}
++
++EXPORT
++void nvnc_set_client_message_fn(struct nvnc* self, nvnc_client_message_fn fn)
++{
++	self->client_message_fn = fn;
++}
++
++EXPORT
++int nvnc_client_send_message(struct nvnc_client* client, const void* msg,
++		size_t len)
++{
++	if (client->net_stream->state == STREAM_STATE_CLOSED)
++		return -1;
++	return stream_write(client->net_stream, msg, len, NULL, NULL);
++}
++
+ EXPORT
+ void nvnc_add_display(struct nvnc* self, struct nvnc_display* display)
+ {
+-- 
+2.51.1
+
