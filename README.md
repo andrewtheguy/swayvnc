@@ -27,6 +27,9 @@ records and logs it.
 The scale is the compositor's exact value from wlr-output-management, with
 `wl_output.scale` as the fallback.
 
-`build-and-install.sh` fetches the Debian sources, applies the patches with
-quilt, builds both packages with a `+swayvnc1` version suffix, installs them and
-puts them on hold.
+`scripts/build-debs.sh` builds both packages for Debian trixie on arm64 and
+amd64 in Docker, from the Debian source packages with the patches applied by
+quilt, and writes the `.deb` files and a `SHA256SUMS` under `output/trixie/<arch>/`.
+The versions carry a `+swayvnc1` suffix. On a host, install `libneatvnc0` and
+`wayvnc` with `dpkg -i` and hold them so an upgrade does not put the stock
+packages back.
