@@ -25,9 +25,10 @@ build() {
 	cd "$here/src/$pkg"
 	apt-get source "$pkg"
 	cd "$(find . -mindepth 1 -maxdepth 1 -type d -name "$pkg-*" | head -n 1)"
-	for patch in "$here"/patches/"$pkg"/*.patch; do
-		quilt import "$patch"
-	done
+	# One import for all of them: quilt inserts each imported patch after the
+	# current top, so importing one at a time with nothing applied reverses
+	# the series.
+	quilt import "$here"/patches/"$pkg"/*.patch
 	quilt push -a
 	version="$(dpkg-parsechangelog -S Version)$suffix"
 	dch --newversion "$version" --distribution unstable --force-distribution \

@@ -21,8 +21,15 @@ type `0xe0`, whenever the captured output's scale or size changes:
 
 The first one is the answer to `SetEncodings`, which is how support is
 announced. The client may send a `ClientDensity` message with the same type:
-`0xe0`, three padding bytes, then its density as a 16.16 scale. This version
-records and logs it.
+`0xe0`, three padding bytes, then the density it wants the output drawn at as a
+16.16 scale. wayvnc sets the captured output's scale to it through
+wlr-output-management under the same rules as a client's `SetDesktopSize` — a
+headless output, resizing enabled, and the client owns the layout or nobody
+does yet — and answers every declaration with an `OutputScale`: after the
+compositor has applied the change, or at once with the scale as it is when
+nothing is to be changed or nothing can be. A client that declares its density
+before asking for a size therefore gets the desktop drawn once, in the right
+pixels.
 
 The scale is the compositor's exact value from wlr-output-management, with
 `wl_output.scale` as the fallback.

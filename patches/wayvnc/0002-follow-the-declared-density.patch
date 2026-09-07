@@ -1,0 +1,282 @@
+From 98a378c47d7f5282c38bd217964c0691c242d7dd Mon Sep 17 00:00:00 2001
+From: Andrew Chen <andrew@jaanuu.com>
+Date: Mon, 7 Sep 2026 13:16:10 -0700
+Subject: [PATCH] Set the output's scale to the density a client declares, and
+ answer every declaration
+
+---
+ include/output-management.h | 10 +++++
+ src/main.c                  | 81 +++++++++++++++++++++++++++++++++++--
+ src/output-management.c     | 62 ++++++++++++++++++++++------
+ 3 files changed, 136 insertions(+), 17 deletions(-)
+
+diff --git a/include/output-management.h b/include/output-management.h
+index babdc58..175ecef 100644
+--- a/include/output-management.h
++++ b/include/output-management.h
+@@ -33,6 +33,16 @@ bool wlr_output_manager_get_head_scale(const char* name, double* scale);
+ /* Called once per done event for every head whose scale changed. */
+ void wlr_output_manager_set_head_scale_fn(wlr_output_manager_head_scale_fn fn,
+ 		void* userdata);
++typedef void (*wlr_output_manager_config_failed_fn)(void* userdata);
++/* Called when the compositor rejects or cancels a configuration this module
++ * applied, i.e. when no head change will follow it.
++ */
++void wlr_output_manager_set_config_failed_fn(
++		wlr_output_manager_config_failed_fn fn, void* userdata);
+ bool wlr_output_manager_resize_output(struct output* output,
+ 	uint16_t width, uint16_t height);
++/* Set the head's scale, keeping its mode; the compositor reports the result
++ * through the head scale callback, or the failure callback.
++ */
++bool wlr_output_manager_set_output_scale(struct output* output, double scale);
+ void wlr_output_manager_destroy(void);
+diff --git a/src/main.c b/src/main.c
+index 50c9437..5276c7c 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -160,8 +160,11 @@ struct wayvnc_client {
+ /* A private RFB extension carrying pixel density, which standard RFB has no
+  * word for. The client lists the pseudo-encoding in SetEncodings; the server
+  * answers with an OutputScale message and repeats it whenever the captured
+- * output's scale or size changes. The client may declare its own density with
+- * a ClientDensity message. Scales are 16.16 unsigned fixed point.
++ * output's scale or size changes. The client may declare the density it wants
++ * the output drawn at with a ClientDensity message: the server sets the
++ * output's scale to it where it may, and every declaration is answered with
++ * an OutputScale, after the change or in its place. Scales are 16.16 unsigned
++ * fixed point.
+  */
+ #define SWAYVNC_ENCODING_DENSITY 0x53564e43 /* 'SVNC' */
+ #define SWAYVNC_MSG_DENSITY 0xe0
+@@ -177,6 +180,7 @@ static void on_nvnc_client_new(struct nvnc_client* client);
+ static void broadcast_output_scale(struct wayvnc* self);
+ static void on_head_scale_change(const char* name, double scale,
+ 		void* userdata);
++static void on_output_config_failed(void* userdata);
+ static void on_client_encodings(struct nvnc_client* nvnc_client,
+ 		const int32_t* encodings, size_t n_encodings);
+ static int on_client_extension_message(struct nvnc_client* nvnc_client,
+@@ -312,6 +316,8 @@ static void registry_add(void* data, struct wl_registry* registry,
+ 			wl_registry_bind(registry, id,
+ 				&zwlr_output_manager_v1_interface, 1);
+ 		wlr_output_manager_setup(wlr_output_manager);
++		wlr_output_manager_set_config_failed_fn(on_output_config_failed,
++				self);
+ 		wlr_output_manager_set_head_scale_fn(on_head_scale_change,
+ 				self);
+ 		return;
+@@ -1155,6 +1161,57 @@ static void on_client_encodings(struct nvnc_client* nvnc_client,
+ 	send_output_scale(client);
+ }
+ 
++static bool scales_equal(double a, double b)
++{
++	double diff = a - b;
++	return diff < 0.005 && diff > -0.005;
++}
++
++/* Set the captured output's scale to the density the client declared, the way
++ * a client's SetDesktopSize sets its mode: only for the client that owns the
++ * layout, and only where resizing is allowed at all. The compositor's head
++ * change then reports the new scale to every client. When nothing is to be
++ * changed, or nothing can be, the client is answered with the current scale
++ * at once, so a declaration is never left without a report.
++ */
++static void follow_client_density(struct wayvnc_client* client)
++{
++	struct wayvnc* self = client->server;
++	struct output* output = self->selected_output;
++	if (!output)
++		return;
++
++	double density = client->declared_density;
++	double current = output_scale(output);
++	if (scales_equal(current, density)) {
++		send_output_scale(client);
++		return;
++	}
++
++	if (!self->enable_resizing) {
++		nvnc_log(NVNC_LOG_INFO,
++			"Not following client %u's density %.2f: resizing is disabled",
++			client->id, density);
++		send_output_scale(client);
++		return;
++	}
++
++	if (self->master_layout_client && self->master_layout_client != client) {
++		nvnc_log(NVNC_LOG_INFO,
++			"Not following client %u's density %.2f: another client owns the layout",
++			client->id, density);
++		send_output_scale(client);
++		return;
++	}
++
++	self->master_layout_client = client;
++	nvnc_log(NVNC_LOG_INFO,
++		"Following client %u's density: setting output %s scale from %.2f to %.2f",
++		client->id, output->name, current, density);
++	if (!wlr_output_manager_set_output_scale(output, density))
++		send_output_scale(client);
++}
++
+ static int on_client_extension_message(struct nvnc_client* nvnc_client,
+ 		const uint8_t* msg, size_t len)
+ {
+@@ -1168,14 +1225,30 @@ static int on_client_extension_message(struct nvnc_client* nvnc_client,
+ 		(uint32_t)msg[6] << 8 | msg[7];
+ 	double density = fixed / 65536.0;
+ 
+-	if (client) {
+-		client->declared_density = density;
++	if (client && client->wants_output_scale) {
+ 		nvnc_log(NVNC_LOG_INFO, "Client %u declares a display density of %.2f",
+ 				client->id, density);
++		if (density < 0.5 || density > 8.0) {
++			nvnc_log(NVNC_LOG_WARNING,
++				"Ignoring client %u's density %.2f: out of range",
++				client->id, density);
++			send_output_scale(client);
++		} else {
++			client->declared_density = density;
++			follow_client_density(client);
++		}
+ 	}
+ 	return SWAYVNC_CLIENT_DENSITY_LEN;
+ }
+ 
++static void on_output_config_failed(void* userdata)
++{
++	struct wayvnc* self = userdata;
++	nvnc_log(NVNC_LOG_WARNING,
++		"The compositor rejected the output configuration; reporting the scale as it is");
++	broadcast_output_scale(self);
++}
++
+ static void on_output_scale_change(struct output* output)
+ {
+ 	struct wayvnc* self = output->userdata;
+diff --git a/src/output-management.c b/src/output-management.c
+index 0bdfb73..2ec0b98 100644
+--- a/src/output-management.c
++++ b/src/output-management.c
+@@ -38,6 +38,8 @@ static uint32_t last_config_serial;
+ static struct zwlr_output_manager_v1* wlr_output_manager;
+ static wlr_output_manager_head_scale_fn head_scale_fn;
+ static void* head_scale_userdata;
++static wlr_output_manager_config_failed_fn config_failed_fn;
++static void* config_failed_userdata;
+ 
+ /* single head properties */
+ static void output_head_name(void* data,
+@@ -150,6 +152,8 @@ static void output_manager_config_failed(void* data,
+ {
+ 	nvnc_trace("config request failed");
+ 	zwlr_output_configuration_v1_destroy(config);
++	if (config_failed_fn)
++		config_failed_fn(config_failed_userdata);
+ }
+ 
+ static void output_manager_config_cancelled(void* data,
+@@ -157,6 +161,8 @@ static void output_manager_config_cancelled(void* data,
+ {
+ 	nvnc_trace("config request cancelled");
+ 	zwlr_output_configuration_v1_destroy(config);
++	if (config_failed_fn)
++		config_failed_fn(config_failed_userdata);
+ }
+ 
+ struct zwlr_output_configuration_v1_listener wlr_output_config_listener = {
+@@ -240,6 +246,13 @@ void wlr_output_manager_set_head_scale_fn(wlr_output_manager_head_scale_fn fn,
+ 	head_scale_userdata = userdata;
+ }
+ 
++void wlr_output_manager_set_config_failed_fn(
++		wlr_output_manager_config_failed_fn fn, void* userdata)
++{
++	config_failed_fn = fn;
++	config_failed_userdata = userdata;
++}
++
+ void wlr_output_manager_setup(struct zwlr_output_manager_v1* output_manager)
+ {
+ 	if (wlr_output_manager)
+@@ -270,18 +283,22 @@ void wlr_output_manager_destroy(void)
+ 	last_config_serial = 0;
+ }
+ 
+-bool wlr_output_manager_resize_output(struct output* output,
+-		uint16_t width, uint16_t height)
++/* Apply a configuration that changes the named output's mode, when width and
++ * height are nonzero, and its scale, when scale is nonzero, and leaves every
++ * other property of every head as the compositor has it.
++ */
++static bool configure_output(struct output* output, uint16_t width,
++		uint16_t height, double scale)
+ {
+ 	if (!wlr_output_manager) {
+ 		nvnc_log(NVNC_LOG_INFO,
+-			"output-management protocol not available, not resizing output");
++			"output-management protocol not available, not reconfiguring output");
+ 		return false;
+ 	}
+ 
+ 	if (!output->is_headless) {
+ 		nvnc_log(NVNC_LOG_INFO,
+-			"not resizing output %s: not a headless one",
++			"not reconfiguring output %s: not a headless one",
+ 			output->name);
+ 		return false;
+ 	}
+@@ -310,15 +327,23 @@ bool wlr_output_manager_resize_output(struct output* output,
+ 			config, head->head);
+ 		if (head->name && strcmp(head->name, output->name) == 0) {
+ 			nvnc_trace("reconfiguring output %s", head->name);
+-			zwlr_output_configuration_head_v1_set_custom_mode(
+-				config_head, width, height, refresh_rate);
+-
+-			/* It doesn't make any sense to have rotation on a
+-			 * headless display, so we set the transform here to be
+-			 * sure.
+-			 */
+-			zwlr_output_configuration_head_v1_set_transform(
+-					config_head, WL_OUTPUT_TRANSFORM_NORMAL);
++			if (width && height) {
++				zwlr_output_configuration_head_v1_set_custom_mode(
++					config_head, width, height,
++					refresh_rate);
++
++				/* It doesn't make any sense to have rotation on
++				 * a headless display, so we set the transform
++				 * here to be sure.
++				 */
++				zwlr_output_configuration_head_v1_set_transform(
++					config_head,
++					WL_OUTPUT_TRANSFORM_NORMAL);
++			}
++			if (scale > 0)
++				zwlr_output_configuration_head_v1_set_scale(
++					config_head,
++					wl_fixed_from_double(scale));
+ 		}
+ 
+ 		zwlr_output_configuration_head_v1_destroy(config_head);
+@@ -328,3 +353,14 @@ bool wlr_output_manager_resize_output(struct output* output,
+ 	zwlr_output_configuration_v1_apply(config);
+ 	return true;
+ }
++
++bool wlr_output_manager_resize_output(struct output* output,
++		uint16_t width, uint16_t height)
++{
++	return configure_output(output, width, height, 0);
++}
++
++bool wlr_output_manager_set_output_scale(struct output* output, double scale)
++{
++	return configure_output(output, 0, 0, scale);
++}
+-- 
+2.51.1
+
