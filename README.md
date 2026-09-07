@@ -30,10 +30,11 @@ The scale is the compositor's exact value from wlr-output-management, with
 `scripts/build-debs.sh` builds both packages for Debian trixie on arm64 and
 amd64 in Docker, from the Debian source packages with the patches applied by
 quilt, and writes the `.deb` files and a `SHA256SUMS` under `output/trixie/<arch>/`.
-The versions carry a `+swayvnc1` suffix. On a host, install `libneatvnc0` and
-`wayvnc` with `dpkg -i` and hold them so an upgrade does not put the stock
-packages back.
 
-Pushing a `v*` tag runs the same build on GitHub Actions for both architectures
-and attaches the packages and a merged `SHA256SUMS` to the release, which is
-what the `workstation-ansible` sway role downloads by checksum.
+Releases are made by the **Build and release packages** workflow, run by hand.
+It tags the release `trixie-<YYYYMMDD>-<N>` — the distribution and the build,
+never a library version — and the packages inside keep Debian's versions with a
+`+swayvnc<YYYYMMDD>.<N>` suffix, so a later build always sorts newer for dpkg. On
+a host, install `libneatvnc0` and `wayvnc` for its architecture from the release
+with `dpkg -i` and hold them so an upgrade does not put the stock packages back;
+the `workstation-ansible` sway role does exactly that by checksum.

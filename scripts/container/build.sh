@@ -3,11 +3,16 @@
 # and wayvnc, applies the patches under ../patches with quilt, and builds
 # binary packages into the directory given as $1. wayvnc is built against the
 # patched libneatvnc-dev, so neatvnc is built and installed first.
+#
+# SWAYVNC_BUILD names the build as <YYYYMMDD>-<N>, the tail of the release tag
+# trixie-<YYYYMMDD>-<N>; each package's Debian version gets the suffix
+# +swayvnc<YYYYMMDD>.<N>, so a later build always sorts newer for dpkg.
 set -eu
 
 out=${1:?output directory}
 here=$(cd "$(dirname "$0")" && pwd)
-suffix=${SWAYVNC_SUFFIX:-+swayvnc}
+build=${SWAYVNC_BUILD:-$(date -u +%Y%m%d)-0}
+suffix="+swayvnc$(echo "$build" | tr '-' '.')"
 export DEBFULLNAME=${DEBFULLNAME:-swayvnc}
 export DEBEMAIL=${DEBEMAIL:-swayvnc@localhost}
 export QUILT_PATCHES=debian/patches
@@ -24,9 +29,9 @@ build() {
 		quilt import "$patch"
 	done
 	quilt push -a
-	# dch appends its own counter to --local, so +swayvnc becomes +swayvnc1.
-	dch --local "$suffix" --distribution unstable \
-		"Apply the swayvnc density extension patches."
+	version="$(dpkg-parsechangelog -S Version)$suffix"
+	dch --newversion "$version" --distribution unstable --force-distribution \
+		"Apply the swayvnc density extension patches (build $build)."
 	dpkg-buildpackage -us -uc -b
 	cd ..
 	cp ./*.deb "$out"/
@@ -38,5 +43,5 @@ dpkg -i "$here"/src/neatvnc/libneatvnc0_*.deb "$here"/src/neatvnc/libneatvnc-dev
 build wayvnc
 
 cd "$out"
-sha256sum ./*.deb > SHA256SUMS
+sha256sum ./*.deb | sed 's#  \./#  #' > SHA256SUMS
 cat SHA256SUMS

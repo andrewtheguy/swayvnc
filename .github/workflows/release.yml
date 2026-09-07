@@ -2,17 +2,48 @@ name: Build and release packages
 
 # Builds the patched neatvnc and wayvnc .debs for Debian trixie on amd64 and
 # arm64 with the same Docker build scripts/build-debs.sh runs locally, and
-# attaches them with their SHA256SUMS to the GitHub release for the pushed tag.
+# publishes them as a GitHub release tagged trixie-<YYYYMMDD>-<N>. The tag names
+# the distribution and the build, never a library version: the packages inside
+# keep Debian's versions with a +swayvnc<YYYYMMDD>.<N> suffix. Run it by hand.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    # Two runs on the same day must not pick the same revision.
+    concurrency:
+      group: release-tag
+      cancel-in-progress: false
+    outputs:
+      build: ${{ steps.tag.outputs.build }}
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          date="$(date -u +%Y%m%d)"
+          n=1
+          while gh release view "trixie-${date}-${n}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; do
+            n=$((n + 1))
+          done
+          echo "build=${date}-${n}" >> "$GITHUB_OUTPUT"
+          echo "tag=trixie-${date}-${n}" >> "$GITHUB_OUTPUT"
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.tag.outputs.tag }}" --repo "${GITHUB_REPOSITORY}" \
+            --draft --target "${GITHUB_SHA}" --title "${{ steps.tag.outputs.tag }}" \
+            --notes "neatvnc and wayvnc from Debian trixie with the swayvnc density extension, build ${{ steps.tag.outputs.build }}, for amd64 and arm64. Install libneatvnc0 and wayvnc for your architecture with dpkg -i and hold them."
+
   build:
+    needs: prepare
     strategy:
       matrix:
         arch: [amd64, arm64]
@@ -21,7 +52,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build the packages
-        run: ./scripts/build-debs.sh ${{ matrix.arch }}
+        run: SWAYVNC_BUILD='${{ needs.prepare.outputs.build }}' ./scripts/build-debs.sh ${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
           name: debs-${{ matrix.arch }}
@@ -29,28 +60,22 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Merge the checksum lists
+      - name: Publish the release
         run: |
           set -euo pipefail
           mkdir -p release
           for arch in amd64 arm64; do
             cp artifacts/debs-${arch}/*.deb release/
-            sed "s#^\(\S*\)  \./#\1  #" artifacts/debs-${arch}/SHA256SUMS >> release/SHA256SUMS
+            cat artifacts/debs-${arch}/SHA256SUMS >> release/SHA256SUMS
           done
           cat release/SHA256SUMS
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "neatvnc and wayvnc 0.9.1 with the swayvnc density extension, for Debian trixie on amd64 and arm64." \
-            release/*
+          gh release upload "${{ needs.prepare.outputs.tag }}" --repo "${GITHUB_REPOSITORY}" release/*
+          gh release edit "${{ needs.prepare.outputs.tag }}" --repo "${GITHUB_REPOSITORY}" --draft=false

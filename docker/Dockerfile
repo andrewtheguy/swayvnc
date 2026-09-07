@@ -17,8 +17,8 @@ WORKDIR /build
 COPY patches /build/patches
 COPY scripts/container/build.sh /build/build.sh
 
-ARG SWAYVNC_SUFFIX=+swayvnc
-RUN SWAYVNC_SUFFIX="${SWAYVNC_SUFFIX}" ./build.sh /out
+ARG SWAYVNC_BUILD
+RUN SWAYVNC_BUILD="${SWAYVNC_BUILD}" ./build.sh /out
 
 FROM scratch
 COPY --from=build /out /
