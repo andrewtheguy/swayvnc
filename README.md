@@ -4,8 +4,9 @@ wayvnc for a sway desktop behind the remotex gateway, as patches on the Debian
 source packages of neatvnc 0.9.1 and wayvnc 0.9.1.
 
 `patches/neatvnc/` adds three application hooks to the library: the client's
-`SetEncodings` list as sent, a handler for client message types the library does
-not dispatch, and a call to write one server message to one client.
+`SetEncodings` list as sent, an empty one included, a handler for client message
+types the library does not dispatch, and a call to write one server message to
+one client.
 
 `patches/wayvnc/` uses them for a private density extension. A client that lists
 the pseudo-encoding `0x53564e43` (`SVNC`) receives an `OutputScale` message,
@@ -27,9 +28,11 @@ wlr-output-management under the same rules as a client's `SetDesktopSize` — a
 headless output, resizing enabled, and the client owns the layout or nobody
 does yet — and answers every declaration with an `OutputScale`: after the
 compositor has applied the change, or at once with the scale as it is when
-nothing is to be changed or nothing can be. A client that declares its density
-before asking for a size therefore gets the desktop drawn once, in the right
-pixels.
+nothing is to be changed or nothing can be. A configuration the compositor
+accepts without changing the head's scale is answered as well: the `succeeded`
+is followed by one round trip, and the scale is reported as it is when no head
+change has arrived by then. A client that declares its density before asking
+for a size therefore gets the desktop drawn once, in the right pixels.
 
 The scale is the compositor's exact value from wlr-output-management, with
 `wl_output.scale` as the fallback.

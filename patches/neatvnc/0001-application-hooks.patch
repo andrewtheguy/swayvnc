@@ -1,4 +1,4 @@
-From f1eff5fece95f66596acb32666b4e4ef9483e469 Mon Sep 17 00:00:00 2001
+From d466ee00b0543048894969973b206cdf3f759fa2 Mon Sep 17 00:00:00 2001
 From: Andrew Chen <andrew@jaanuu.com>
 Date: Mon, 7 Sep 2026 12:15:08 -0700
 Subject: [PATCH] Let the application see raw client encodings, handle unknown
@@ -10,9 +10,9 @@ handler for client message types the library does not dispatch, and a way to
 write one server message to one client.
 ---
  include/common.h  |  2 ++
- include/neatvnc.h | 21 +++++++++++++++++++++
- src/server.c      | 43 +++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 66 insertions(+)
+ include/neatvnc.h | 23 +++++++++++++++++++++++
+ src/server.c      | 48 +++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 73 insertions(+)
 
 diff --git a/include/common.h b/include/common.h
 index e0b87c2..9500f7f 100644
@@ -28,16 +28,18 @@ index e0b87c2..9500f7f 100644
  	struct {
  		struct nvnc_fb* buffer;
 diff --git a/include/neatvnc.h b/include/neatvnc.h
-index 78d9f97..8ae5a84 100644
+index 78d9f97..9571a82 100644
 --- a/include/neatvnc.h
 +++ b/include/neatvnc.h
-@@ -132,6 +132,20 @@ typedef void (*nvnc_cleanup_fn)(void* userdata);
+@@ -132,6 +132,22 @@ typedef void (*nvnc_cleanup_fn)(void* userdata);
  typedef void (*nvnc_log_fn)(const struct nvnc_log_data*, const char* message);
  typedef bool (*nvnc_desktop_layout_fn)(
  		struct nvnc_client*, const struct nvnc_desktop_layout*);
 +/* Called after every SetEncodings with the list exactly as the client sent it,
 + * unknown and pseudo-encodings included, so an application can negotiate its
 + * own extensions. The library has already kept the encodings it understands.
++ * An empty list is delivered as such, with n_encodings 0: it withdraws
++ * whatever the client had negotiated.
 + */
 +typedef void (*nvnc_client_encodings_fn)(struct nvnc_client*,
 +		const int32_t* encodings, size_t n_encodings);
@@ -52,7 +54,7 @@ index 78d9f97..8ae5a84 100644
  
  extern const char nvnc_version[];
  
-@@ -170,6 +184,13 @@ void nvnc_set_new_client_fn(struct nvnc* self, nvnc_client_fn);
+@@ -170,6 +186,13 @@ void nvnc_set_new_client_fn(struct nvnc* self, nvnc_client_fn);
  void nvnc_set_client_cleanup_fn(struct nvnc_client* self, nvnc_client_fn fn);
  void nvnc_set_cut_text_fn(struct nvnc*, nvnc_cut_text_fn fn);
  void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn);
@@ -67,18 +69,23 @@ index 78d9f97..8ae5a84 100644
  bool nvnc_has_auth(void);
  int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
 diff --git a/src/server.c b/src/server.c
-index b94ed0d..3c8e1d2 100644
+index b94ed0d..19d3dbd 100644
 --- a/src/server.c
 +++ b/src/server.c
-@@ -688,6 +688,18 @@ static int on_client_set_encodings(struct nvnc_client* client)
+@@ -688,6 +688,23 @@ static int on_client_set_encodings(struct nvnc_client* client)
  	if (client_has_encoding(client, RFB_ENCODING_FENCE))
  		send_ping(client, 0);
  
++	/* An empty list is a SetEncodings too: the client withdrawing every
++	 * optional encoding, which the application has to hear about as much as
++	 * the reverse.
++	 */
 +	nvnc_client_encodings_fn encodings_fn =
 +		client->server->client_encodings_fn;
-+	if (encodings_fn && n_encodings > 0) {
-+		int32_t* list = malloc(n_encodings * sizeof(*list));
-+		if (list) {
++	if (encodings_fn) {
++		int32_t* list = n_encodings ?
++			malloc(n_encodings * sizeof(*list)) : NULL;
++		if (list || n_encodings == 0) {
 +			for (size_t i = 0; i < n_encodings; ++i)
 +				list[i] = ntohl(msg->encodings[i]);
 +			encodings_fn(client, list, n_encodings);
@@ -89,7 +96,7 @@ index b94ed0d..3c8e1d2 100644
  	return sizeof(*msg) + 4 * n_encodings;
  }
  
-@@ -1881,6 +1893,15 @@ static int on_client_message(struct nvnc_client* client)
+@@ -1881,6 +1898,15 @@ static int on_client_message(struct nvnc_client* client)
  		return on_client_fence(client);
  	}
  
@@ -105,7 +112,7 @@ index b94ed0d..3c8e1d2 100644
  	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable message from client: %p",
  			client);
  	nvnc_client_close(client);
-@@ -2600,6 +2621,28 @@ void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn fn)
+@@ -2600,6 +2626,28 @@ void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn fn)
  	self->desktop_layout_fn = fn;
  }
  
