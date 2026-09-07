@@ -1,4 +1,4 @@
-From b4d8574d03769504049a444864c1c74619b64743 Mon Sep 17 00:00:00 2001
+From 49cceab96a00944e9bd6edb711e8577ed23be078 Mon Sep 17 00:00:00 2001
 From: Andrew Chen <andrew@jaanuu.com>
 Date: Mon, 7 Sep 2026 12:15:08 -0700
 Subject: [PATCH] Report the captured output's scale to clients that ask, and
@@ -11,10 +11,10 @@ declare its own density with the same message type; this version records it.
 ---
  include/output-management.h |  10 +++
  include/output.h            |   7 ++
- src/main.c                  | 137 ++++++++++++++++++++++++++++++++++++
- src/output-management.c     |  47 ++++++++++++-
+ src/main.c                  | 141 ++++++++++++++++++++++++++++++++++++
+ src/output-management.c     |  47 +++++++++++-
  src/output.c                |  11 +++
- 5 files changed, 210 insertions(+), 2 deletions(-)
+ 5 files changed, 214 insertions(+), 2 deletions(-)
 
 diff --git a/include/output-management.h b/include/output-management.h
 index aae69ea..babdc58 100644
@@ -63,10 +63,10 @@ index 8706d9b..d5c9ab3 100644
  
  	void* userdata;
 diff --git a/src/main.c b/src/main.c
-index f7cfc9a..62c0d53 100644
+index f7cfc9a..50c9437 100644
 --- a/src/main.c
 +++ b/src/main.c
-@@ -149,14 +149,34 @@ struct wayvnc_client {
+@@ -149,14 +149,38 @@ struct wayvnc_client {
  	struct pointer pointer;
  	struct keyboard keyboard;
  	struct data_control data_control;
@@ -98,10 +98,14 @@ index f7cfc9a..62c0d53 100644
 +static void broadcast_output_scale(struct wayvnc* self);
 +static void on_head_scale_change(const char* name, double scale,
 +		void* userdata);
++static void on_client_encodings(struct nvnc_client* nvnc_client,
++		const int32_t* encodings, size_t n_encodings);
++static int on_client_extension_message(struct nvnc_client* nvnc_client,
++		const uint8_t* msg, size_t len);
  void switch_to_output(struct wayvnc*, struct output*);
  void switch_to_next_output(struct wayvnc*);
  void switch_to_prev_output(struct wayvnc*);
-@@ -288,6 +308,8 @@ static void registry_add(void* data, struct wl_registry* registry,
+@@ -288,6 +312,8 @@ static void registry_add(void* data, struct wl_registry* registry,
  			wl_registry_bind(registry, id,
  				&zwlr_output_manager_v1_interface, 1);
  		wlr_output_manager_setup(wlr_output_manager);
@@ -110,7 +114,7 @@ index f7cfc9a..62c0d53 100644
  		return;
  	}
  
-@@ -988,6 +1010,8 @@ static int init_nvnc(struct wayvnc* self, const char* addr, uint16_t port,
+@@ -988,6 +1014,8 @@ static int init_nvnc(struct wayvnc* self, const char* addr, uint16_t port,
  
  	nvnc_set_new_client_fn(self->nvnc, on_nvnc_client_new);
  	nvnc_set_cut_text_fn(self->nvnc, on_client_cut_text);
@@ -119,7 +123,7 @@ index f7cfc9a..62c0d53 100644
  
  	if (blank_screen(self) != 0)
  		goto blank_screen_failure;
-@@ -1063,6 +1087,110 @@ static void wayvnc_restart_capture(struct wayvnc* self)
+@@ -1063,6 +1091,110 @@ static void wayvnc_restart_capture(struct wayvnc* self)
  	aml_start(aml_get_default(), self->capture_retry_timer);
  }
  
@@ -230,7 +234,7 @@ index f7cfc9a..62c0d53 100644
  // TODO: Handle transform change too
  void on_output_dimension_change(struct output* output)
  {
-@@ -1072,6 +1200,11 @@ void on_output_dimension_change(struct output* output)
+@@ -1072,6 +1204,11 @@ void on_output_dimension_change(struct output* output)
  	if (self->nr_clients == 0)
  		return;
  
@@ -242,7 +246,7 @@ index f7cfc9a..62c0d53 100644
  	nvnc_log(NVNC_LOG_DEBUG, "Output dimensions changed. Restarting frame capturer...");
  
  	screencopy_stop(self->screencopy);
-@@ -1694,15 +1827,19 @@ void set_selected_output(struct wayvnc* self, struct output* output)
+@@ -1694,15 +1831,19 @@ void set_selected_output(struct wayvnc* self, struct output* output)
  {
  	if (self->selected_output) {
  		self->selected_output->on_dimension_change = NULL;
