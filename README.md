@@ -33,3 +33,7 @@ quilt, and writes the `.deb` files and a `SHA256SUMS` under `output/trixie/<arch
 The versions carry a `+swayvnc1` suffix. On a host, install `libneatvnc0` and
 `wayvnc` with `dpkg -i` and hold them so an upgrade does not put the stock
 packages back.
+
+Pushing a `v*` tag runs the same build on GitHub Actions for both architectures
+and attaches the packages and a merged `SHA256SUMS` to the release, which is
+what the `workstation-ansible` sway role downloads by checksum.

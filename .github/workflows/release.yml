@@ -1,0 +1,56 @@
+name: Build and release packages
+
+# Builds the patched neatvnc and wayvnc .debs for Debian trixie on amd64 and
+# arm64 with the same Docker build scripts/build-debs.sh runs locally, and
+# attaches them with their SHA256SUMS to the GitHub release for the pushed tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the packages
+        run: ./scripts/build-debs.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.arch }}
+          path: output/trixie/${{ matrix.arch }}/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Merge the checksum lists
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for arch in amd64 arm64; do
+            cp artifacts/debs-${arch}/*.deb release/
+            sed "s#^\(\S*\)  \./#\1  #" artifacts/debs-${arch}/SHA256SUMS >> release/SHA256SUMS
+          done
+          cat release/SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "neatvnc and wayvnc 0.9.1 with the swayvnc density extension, for Debian trixie on amd64 and arm64." \
+            release/*
